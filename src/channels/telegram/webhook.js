@@ -243,7 +243,10 @@ class TelegramWebhookHandler {
             return;
         }
 
-        // Personal-chat default session: "/cmd review" or simply "review".
+        // Personal-chat selected session: "/cmd review" or simply "review".
+        // Plain text is how the panel is used almost every time, so it reads the
+        // same selection the buttons do; `_getPanelSession` falls back to the
+        // default when nothing has been selected.
         const defaultCommand = messageText.match(/^\/cmd\s+(.+)$/s)?.[1] ||
             (!messageText.startsWith('/') ? messageText : null);
         if (defaultCommand) {
@@ -253,9 +256,9 @@ class TelegramWebhookHandler {
             }
             await this._processSessionCommand(
                 chatId,
-                this.config.defaultSession,
+                this._getPanelSession(chatId),
                 defaultCommand,
-                'default'
+                'selected'
             );
             return;
         }
@@ -1043,8 +1046,8 @@ class TelegramWebhookHandler {
             `• \`/mode <ask|edits|plan|auto>\` - Set permission mode\n` +
             `• \`/session <alias>\` - Select the panel session\n` +
             `• \`/new <alias> <project>\` - Open an existing project in a new session\n` +
-            `• \`<command>\` - Send to ${this.config.defaultSession}\n` +
-            `• \`/cmd <command>\` - Send to ${this.config.defaultSession}\n` +
+            `• \`<command>\` - Send to ${this._getPanelSession(chatId)}\n` +
+            `• \`/cmd <command>\` - Send to ${this._getPanelSession(chatId)}\n` +
             `${aliasLines ? `${aliasLines}\n` : ''}` +
             `• \`/cmd <TOKEN> <command>\` - Explicit notification session\n\n` +
             `*Examples:*\n` +
