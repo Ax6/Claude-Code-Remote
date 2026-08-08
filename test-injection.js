@@ -31,4 +31,4 @@ async function testInjection() {
     }
 }
 
-testInjection().catch(console.error); < /dev/null
+testInjection().catch(console.error);
