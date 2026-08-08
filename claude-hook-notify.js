@@ -36,9 +36,25 @@ const TelegramChannel = require('./src/channels/telegram/telegram');
 const DesktopChannel = require('./src/channels/local/desktop');
 const EmailChannel = require('./src/channels/email/smtp');
 
+async function readHookInput() {
+    if (process.stdin.isTTY) return {};
+
+    let raw = '';
+    for await (const chunk of process.stdin) raw += chunk;
+    if (!raw.trim()) return {};
+
+    try {
+        return JSON.parse(raw);
+    } catch (error) {
+        console.error('⚠️ Could not parse Claude hook input:', error.message);
+        return {};
+    }
+}
+
 async function sendHookNotification() {
     try {
         console.log('🔔 Claude Hook: Sending notifications...');
+        const hookInput = await readHookInput();
         
         // Get notification type from command line argument
         const notificationType = process.argv[2] || 'completed';
@@ -91,7 +107,7 @@ async function sendHookNotification() {
         }
         
         // Get current working directory and tmux session
-        const currentDir = process.cwd();
+        const currentDir = hookInput.cwd || process.cwd();
         const projectName = path.basename(currentDir);
         
         // Try to get current tmux session
@@ -114,8 +130,13 @@ async function sendHookNotification() {
             type: notificationType,
             title: `Claude ${notificationType === 'completed' ? 'Task Completed' : 'Waiting for Input'}`,
             message: `Claude has ${notificationType === 'completed' ? 'completed a task' : 'is waiting for input'}`,
-            project: projectName
-            // Don't set metadata here - let TelegramChannel extract real conversation content
+            project: projectName,
+            metadata: {
+                claudeResponse: hookInput.last_assistant_message || '',
+                tmuxSession,
+                directReply: Boolean(hookInput.last_assistant_message),
+                sessionId: hookInput.session_id || null
+            }
         };
         
         console.log(`📱 Sending ${notificationType} notification for project: ${projectName}`);

@@ -14,7 +14,7 @@ const { execSync } = require('child_process');
 class TelegramChannel extends NotificationChannel {
     constructor(config = {}) {
         super('telegram', config);
-        this.sessionsDir = path.join(__dirname, '../../data/sessions');
+        this.sessionsDir = process.env.SESSION_DATA_DIR || path.join(__dirname, '../../data/sessions');
         this.tmuxMonitor = new TmuxMonitor();
         this.apiBaseUrl = 'https://api.telegram.org';
         this.botUsername = null; // Cache for bot username
@@ -125,7 +125,10 @@ class TelegramChannel extends NotificationChannel {
         await this._createSession(sessionId, notification, token);
 
         // Generate Telegram message
-        const messageText = this._generateTelegramMessage(notification, sessionId, token);
+        const isDirectReply = Boolean(notification.metadata?.directReply);
+        const messageText = isDirectReply
+            ? this._generateDirectReply(notification)
+            : this._generateTelegramMessage(notification, sessionId, token);
         
         // Determine recipient (chat or group)
         const chatId = this.config.groupId || this.config.chatId;
@@ -133,27 +136,24 @@ class TelegramChannel extends NotificationChannel {
         
         // Create buttons using callback_data instead of inline query
         // This avoids the automatic @bot_name addition
-        const buttons = [
-            [
-                {
-                    text: '📝 Personal Chat',
-                    callback_data: `personal:${token}`
-                },
-                {
-                    text: '👥 Group Chat', 
-                    callback_data: `group:${token}`
-                }
-            ]
-        ];
+        const buttons = isDirectReply
+            ? [[{ text: '🎛 Controls', callback_data: 'ctl:panel' }]]
+            : [
+                [
+                    { text: '📝 Personal Chat', callback_data: `personal:${token}` },
+                    { text: '👥 Group Chat', callback_data: `group:${token}` }
+                ],
+                [{ text: '🎛 Controls', callback_data: 'ctl:panel' }]
+            ];
         
         const requestData = {
             chat_id: chatId,
             text: messageText,
-            parse_mode: 'Markdown',
             reply_markup: {
                 inline_keyboard: buttons
             }
         };
+        if (!isDirectReply) requestData.parse_mode = 'Markdown';
 
         try {
             const response = await axios.post(
@@ -170,6 +170,15 @@ class TelegramChannel extends NotificationChannel {
             await this._removeSession(sessionId);
             return false;
         }
+    }
+
+    _generateDirectReply(notification) {
+        const response = String(notification.metadata?.claudeResponse || '').trim();
+        if (!response) return 'Claude finished without a text response.';
+
+        // Telegram text messages are limited to 4096 characters. Leave room
+        // for a continuation marker while keeping arbitrary Claude markdown safe.
+        return response.length > 4000 ? `${response.slice(0, 3997)}...` : response;
     }
 
     _generateTelegramMessage(notification, sessionId, token) {

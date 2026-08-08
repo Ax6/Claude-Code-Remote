@@ -1,0 +1,29 @@
+#!/bin/zsh
+set -e
+
+session_name="claudio"
+claude_bin="${CLAUDE_CLI_PATH:-$(command -v claude)}"
+tmux_bin="${TMUX_BIN:-$(command -v tmux)}"
+default_workdir="${CLAUDIO_PROJECTS_ROOT:-$PWD}"
+workdir="${1:-$default_workdir}"
+
+if [[ -z "$claude_bin" || -z "$tmux_bin" ]]; then
+    print -u2 "Claudio requires both claude and tmux on PATH"
+    exit 1
+fi
+
+if [[ ! -d "$workdir" ]]; then
+    print -u2 "Claudio working directory does not exist: $workdir"
+    exit 1
+fi
+
+if [[ -n "${TMUX:-}" ]]; then
+    cd "$workdir"
+    exec "$claude_bin"
+fi
+
+if "$tmux_bin" has-session -t "$session_name" 2>/dev/null; then
+    exec "$tmux_bin" attach-session -t "$session_name"
+fi
+
+exec "$tmux_bin" new-session -s "$session_name" -c "$workdir" "$claude_bin"

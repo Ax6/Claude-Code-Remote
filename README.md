@@ -302,6 +302,36 @@ Click smart button to get format:
 👥 Group Chat: @bot_name /cmd TOKEN123 your command here
 ```
 
+#### Telegram chat controls
+
+For a private, whitelisted chat, tokenless commands and persistent numbered
+sessions can be enabled:
+
+```env
+TELEGRAM_ALLOW_TOKENLESS_COMMANDS=true
+TELEGRAM_DEFAULT_SESSION=claudio
+TELEGRAM_SESSION_ALIASES=1:claudio
+CLAUDIO_PROJECTS_ROOT=/path/to/Projects
+INJECTION_MODE=tmux
+```
+
+- Send plain text to the default session, or prefix it with a number to target
+  an explicit session: `1 review the changes`.
+- `/panel` opens compact controls for session, model, effort, permission mode,
+  compact, continue, and stop.
+- `/new 2 existing-project` starts Claude in an existing folder below
+  `CLAUDIO_PROJECTS_ROOT`. Missing folders require a Create/Cancel confirmation.
+- Created tmux sessions use a composite name such as
+  `claudio-2-existing-project`; aliases and the selected control-panel session
+  persist across webhook restarts.
+- Claude permission prompts are forwarded as Once/Always/Deny buttons.
+- Telegram shows its native typing indicator while Claude is working, and the
+  Stop hook returns Claude's final response directly to the chat.
+
+These shortcuts remain disabled in groups, where notification tokens are still
+required. Configure `TELEGRAM_WEBHOOK_SECRET` to validate Telegram's webhook
+secret header.
+
 **LINE:**
 ```
 Reply to notification with: Your command here
