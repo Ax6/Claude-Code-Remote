@@ -11,6 +11,7 @@ const fs = require('fs');
 const TmuxMonitor = require('../../utils/tmux-monitor');
 const { execSync } = require('child_process');
 const { toRichMarkdown, splitRichMarkdown } = require('./rich-markdown');
+const { SuggestionStore, looksLikeSuggestion, suggestionKeyboard } = require('./suggestion-store');
 
 class TelegramChannel extends NotificationChannel {
     constructor(config = {}) {
@@ -19,7 +20,12 @@ class TelegramChannel extends NotificationChannel {
         this.tmuxMonitor = new TmuxMonitor();
         this.apiBaseUrl = 'https://api.telegram.org';
         this.botUsername = null; // Cache for bot username
-        
+        this.suggestions = new SuggestionStore({
+            filePath: process.env.TELEGRAM_SUGGESTIONS_FILE ||
+                path.join(path.dirname(this.sessionsDir), 'reply-suggestions.json'),
+            logger: this.logger
+        });
+
         this._ensureDirectories();
         this._validateConfig();
     }
@@ -140,6 +146,14 @@ class TelegramChannel extends NotificationChannel {
         const sent = await this._sendRich(chatId, messageText, buttons);
         if (sent) {
             this.logger.info(`Telegram message sent successfully, Session: ${sessionId}`);
+            // An answer is what a suggested reply gets attached to, so where it
+            // landed has to outlive this process.
+            if (isDirectReply && sent.messageId) {
+                this.suggestions.rememberReply(chatId, {
+                    messageId: sent.messageId,
+                    session: notification.metadata?.tmuxSession || null
+                });
+            }
             return true;
         }
 
@@ -188,8 +202,9 @@ class TelegramChannel extends NotificationChannel {
      */
     async _sendRich(chatId, markdown, buttons) {
         const chunks = splitRichMarkdown(toRichMarkdown(markdown));
-        if (chunks.length === 0) return true;
+        if (chunks.length === 0) return { messageId: null };
 
+        let lastMessageId = null;
         for (const [index, chunk] of chunks.entries()) {
             const isLast = index === chunks.length - 1;
             const payload = {
@@ -200,11 +215,12 @@ class TelegramChannel extends NotificationChannel {
             if (isLast) payload.reply_markup = { inline_keyboard: buttons };
 
             try {
-                await axios.post(
+                const response = await axios.post(
                     `${this.apiBaseUrl}/bot${this.config.botToken}/sendRichMessage`,
                     payload,
                     this._getNetworkOptions()
                 );
+                if (isLast) lastMessageId = response.data?.result?.message_id ?? null;
             } catch (error) {
                 this.logger.warn(
                     `Rich message rejected, falling back to plain text: ${JSON.stringify(error.response?.data?.description || error.message)}`
@@ -213,7 +229,7 @@ class TelegramChannel extends NotificationChannel {
             }
         }
 
-        return true;
+        return { messageId: lastMessageId };
     }
 
     /**
@@ -234,9 +250,48 @@ class TelegramChannel extends NotificationChannel {
                 },
                 this._getNetworkOptions()
             );
-            return true;
+            return { messageId: null };
         } catch (error) {
             this.logger.error('Failed to send Telegram message:', error.response?.data || error.message);
+            return false;
+        }
+    }
+
+    /**
+     * Turn a suggested reply into a button on the answer it follows.
+     *
+     * The suggestion arrives seconds after the answer, from a different hook and
+     * a different process, and it is one line the operator might say next -- so
+     * it belongs on that answer as something to press, not in a bubble of its own
+     * that reads like a message nobody wrote.
+     */
+    async offerSuggestion({ text, session }) {
+        if (!looksLikeSuggestion(text)) return false;
+
+        const chatId = this.config.groupId || this.config.chatId;
+        const entry = this.suggestions.read(chatId);
+        if (!entry || (session && entry.session && entry.session !== session)) return false;
+
+        const added = this.suggestions.addSuggestion(chatId, String(text).trim());
+        if (!added) return false;
+
+        const rows = suggestionKeyboard(
+            { suggestions: added.suggestions },
+            [[{ text: '🎛 Controls', callback_data: 'ctl:panel' }]]
+        );
+        return this._editReplyMarkup(chatId, added.messageId, rows);
+    }
+
+    async _editReplyMarkup(chatId, messageId, rows) {
+        try {
+            await axios.post(
+                `${this.apiBaseUrl}/bot${this.config.botToken}/editMessageReplyMarkup`,
+                { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: rows } },
+                this._getNetworkOptions()
+            );
+            return true;
+        } catch (error) {
+            this.logger.warn(`Could not attach suggestion: ${error.response?.data?.description || error.message}`);
             return false;
         }
     }

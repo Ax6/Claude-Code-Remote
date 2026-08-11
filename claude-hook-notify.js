@@ -65,13 +65,29 @@ async function sendHookNotification() {
         const hookEvent = hookInput.hook_event_name || 'unknown';
         console.log(`🪝 Hook: ${hookEvent} (argv "${notificationType}") · session ${hookInput.session_id || 'unknown'}`);
 
+        const answer = String(hookInput.last_assistant_message || '').trim();
+
         // `last_assistant_message` is only an answer to the operator when the
         // turn itself ended. On SubagentStop it is whatever the last nested call
-        // produced -- including a suggested quick reply the harness generated for
-        // the CLI, which once reached Telegram as a bare "pusha tutto" looking
-        // exactly like a reply nobody wrote.
+        // produced -- and when that is one short line, it is the suggested quick
+        // reply the harness offers in the CLI. Sending it as a message made it
+        // look like a reply nobody wrote; it belongs on the previous answer, as a
+        // button that sends it back when pressed.
         if (hookEvent === 'SubagentStop') {
-            console.log('⏭️ SubagentStop is not an answer to the operator; nothing sent.');
+            if (process.env.TELEGRAM_ENABLED === 'true' && process.env.TELEGRAM_BOT_TOKEN) {
+                const channel = new TelegramChannel({
+                    botToken: process.env.TELEGRAM_BOT_TOKEN,
+                    chatId: process.env.TELEGRAM_CHAT_ID,
+                    groupId: process.env.TELEGRAM_GROUP_ID
+                });
+                const attached = await channel.offerSuggestion({
+                    text: answer,
+                    session: process.env.TMUX_SESSION || null
+                });
+                console.log(attached
+                    ? `💡 Suggested reply attached as a button: "${answer}"`
+                    : '⏭️ SubagentStop carried nothing worth offering; nothing sent.');
+            }
             return;
         }
 
@@ -90,10 +106,24 @@ async function sendHookNotification() {
             const telegramConfig = {
                 botToken: process.env.TELEGRAM_BOT_TOKEN,
                 chatId: process.env.TELEGRAM_CHAT_ID,
-                groupId: process.env.TELEGRAM_GROUP_ID
+                groupId: process.env.TELEGRAM_GROUP_ID,
+                // The channel decides which buttons a notification carries from
+                // this flag. The webhook had it and the notifier did not, so a
+                // notification sent from here looked like it belonged to a chat
+                // that still needs the token ritual.
+                allowTokenlessCommands: process.env.TELEGRAM_ALLOW_TOKENLESS_COMMANDS === 'true'
             };
-            
-            if (telegramConfig.botToken && (telegramConfig.chatId || telegramConfig.groupId)) {
+
+            // With nothing to relay, the notification is a token and directions
+            // for using it -- no answer, no question, nothing that happened.
+            // Where plain text already reaches the session, that is spam, so it
+            // is not sent. Chats that need a token still get theirs.
+            const relayable = answer || !telegramConfig.allowTokenlessCommands;
+            if (!relayable) {
+                console.log('⏭️ Nothing to relay and this chat needs no token; skipping Telegram.');
+            }
+
+            if (relayable && telegramConfig.botToken && (telegramConfig.chatId || telegramConfig.groupId)) {
                 const telegramChannel = new TelegramChannel(telegramConfig);
                 channels.push({ name: 'Telegram', channel: telegramChannel });
             }

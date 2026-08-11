@@ -55,6 +55,9 @@ const selectedSessionsFile = process.env.TELEGRAM_SELECTED_SESSIONS_FILE ||
     path.join(path.dirname(sessionDataDir), 'selected-sessions.json');
 const panelAnchorsFile = process.env.TELEGRAM_PANEL_ANCHORS_FILE ||
     path.join(path.dirname(sessionDataDir), 'panel-anchors.json');
+// Shared with the notify hook, which writes the suggestions this reads.
+const suggestionsFile = process.env.TELEGRAM_SUGGESTIONS_FILE ||
+    path.join(path.dirname(sessionDataDir), 'reply-suggestions.json');
 
 const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'auto'];
 const MODE_ALIASES = { ask: 'default', edits: 'acceptEdits', plan: 'plan', auto: 'auto' };
@@ -84,6 +87,7 @@ const config = {
     sessionAliasesFile,
     selectedSessionsFile,
     panelAnchorsFile,
+    suggestionsFile,
     // Sessions opened from the phone start here. Auto is the default because a
     // remote session with nobody at the keyboard spends its time waiting for
     // permission answers otherwise.

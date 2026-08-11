@@ -338,6 +338,10 @@ INJECTION_MODE=tmux
   and fences are left untouched, and single newlines are kept as line breaks.
   The limit is 32768 characters, split between blocks rather than truncated; if
   the API rejects a message it is resent as plain text.
+- A suggested follow-up reply arrives as a button on the answer it follows, not
+  as a message: pressing it sends that text to the session. It is consumed on
+  press, and it is only offered for one short line, so a subagent's report never
+  becomes a button that sends itself.
 - Claude permission prompts are forwarded as Once/Always/Deny buttons.
 - Telegram shows its native typing indicator while Claude is working, and the
   Stop hook returns Claude's final response directly to the chat.

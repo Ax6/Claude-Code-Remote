@@ -11,6 +11,7 @@ const fs = require('fs');
 const Logger = require('../../core/logger');
 const ControllerInjector = require('../../utils/controller-injector');
 const MessageAnchor = require('./message-anchor');
+const { SuggestionStore, suggestionKeyboard } = require('./suggestion-store');
 const { renderPanel, MODELS, EFFORTS, MODE_LABELS } = require('./panel-view');
 
 // Telegram serves files up to 20MB through getFile; a screenshot that large is
@@ -50,6 +51,12 @@ class TelegramWebhookHandler {
             remove: (chatId, messageId) => this._deleteMessage(chatId, messageId)
         });
         this.uploadsFallbackDir = path.join(__dirname, '../../data/uploads');
+        // Written by the notify hook in another process; read here when a
+        // suggested reply is pressed.
+        this.suggestions = new SuggestionStore({
+            filePath: this.config.suggestionsFile,
+            logger: this.logger
+        });
 
         this._setupMiddleware();
         this._setupRoutes();
@@ -499,6 +506,11 @@ class TelegramWebhookHandler {
             return;
         }
 
+        if (data.startsWith('sug:')) {
+            await this._handleSuggestionCallback(callbackQuery);
+            return;
+        }
+
         if (data.startsWith('ctl:')) {
             await this._handleControlCallback(callbackQuery);
             return;
@@ -572,6 +584,50 @@ class TelegramWebhookHandler {
         }
         if (!folder) folder = session === this.config.defaultSession ? 'Projects' : session;
         return alias ? `${alias} · ${folder}` : `Default · ${folder}`;
+    }
+
+    /**
+     * A suggested reply, pressed. The text goes to the session the answer came
+     * from, and the button that fired is removed: a suggestion is a thing to say
+     * once, and a button that stays is a button that gets pressed twice.
+     */
+    async _handleSuggestionCallback(callbackQuery) {
+        const chatId = callbackQuery.message.chat.id;
+        if (!this._canUseTokenlessCommands(chatId)) {
+            await this._answerCallbackQuery(callbackQuery.id, 'Not authorized');
+            return;
+        }
+
+        const taken = this.suggestions.take(callbackQuery.data.slice('sug:'.length));
+        if (!taken) {
+            await this._answerCallbackQuery(callbackQuery.id, 'This suggestion has expired');
+            return;
+        }
+
+        const session = taken.session || this._getPanelSession(chatId);
+        const result = await this._processSessionCommand(chatId, session, taken.text, 'suggestion');
+        await this._answerCallbackQuery(
+            callbackQuery.id,
+            (result.ok ? `Sent: ${taken.text}` : `❌ ${result.error}`).slice(0, 190)
+        );
+
+        const rows = suggestionKeyboard(
+            { suggestions: taken.remaining },
+            [[{ text: '🎛 Controls', callback_data: 'ctl:panel' }]]
+        );
+        await this._editReplyMarkup(chatId, callbackQuery.message.message_id, rows);
+    }
+
+    async _editReplyMarkup(chatId, messageId, rows) {
+        try {
+            await axios.post(
+                `${this.apiBaseUrl}/bot${this.config.botToken}/editMessageReplyMarkup`,
+                { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: rows } },
+                this._getNetworkOptions()
+            );
+        } catch (error) {
+            this.logger.debug('Could not update suggestion buttons:', error.response?.data?.description || error.message);
+        }
     }
 
     async _handleControlCallback(callbackQuery) {
