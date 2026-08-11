@@ -13,7 +13,9 @@ set -euo pipefail
 
 REPO="${0:A:h}"
 APP="${CLAUDIO_APP_DIR:-$HOME/Library/Application Support/Claudio/app}"
-LABEL="com.aaronrusso.claudio-webhook"
+# Asked of launchd rather than written down: the label names whoever installed
+# the service, and this file is published.
+LABEL="${CLAUDIO_LAUNCH_LABEL:-$(launchctl list | awk '/claudio-webhook/ {print $3; exit}')}"
 PORT="${TELEGRAM_WEBHOOK_PORT:-3001}"
 BACKUP="${TMPDIR:-/tmp}/claudio-deploy-$(date +%Y%m%d-%H%M%S)"
 HEALTH_ATTEMPTS=20
