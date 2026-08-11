@@ -135,17 +135,7 @@ class TelegramChannel extends NotificationChannel {
         const chatId = this.config.groupId || this.config.chatId;
         const isGroupChat = !!this.config.groupId;
         
-        // Create buttons using callback_data instead of inline query
-        // This avoids the automatic @bot_name addition
-        const buttons = isDirectReply
-            ? [[{ text: '🎛 Controls', callback_data: 'ctl:panel' }]]
-            : [
-                [
-                    { text: '📝 Personal Chat', callback_data: `personal:${token}` },
-                    { text: '👥 Group Chat', callback_data: `group:${token}` }
-                ],
-                [{ text: '🎛 Controls', callback_data: 'ctl:panel' }]
-            ];
+        const buttons = this._notificationButtons({ isDirectReply, isGroupChat, token });
         
         const sent = await this._sendRich(chatId, messageText, buttons);
         if (sent) {
@@ -156,6 +146,35 @@ class TelegramChannel extends NotificationChannel {
         // Clean up failed session
         await this._removeSession(sessionId);
         return false;
+    }
+
+    /**
+     * The buttons under a notification.
+     *
+     * The two it used to carry -- "Personal Chat" and "Group Chat" -- were named
+     * after an auto-fill that no longer exists. Upstream used
+     * `switch_inline_query_current_chat`, which prefills the input field but also
+     * inserts the bot's username, wrong in a private chat; this fork replaced it
+     * with a callback that replies with a format to copy by hand. So the tip
+     * promising "a button that auto-fills the command" pointed at a button that
+     * sent a wall of text.
+     *
+     * `copy_text` is the affordance that was missing: a real button that puts
+     * `/cmd <TOKEN> ` on the clipboard, no username, nothing sent. And in the
+     * personal chat it is not needed at all -- plain text already reaches the
+     * selected session, so the token ritual is only for chats that require one.
+     */
+    _notificationButtons({ isDirectReply, isGroupChat, token }) {
+        const controls = [{ text: '🎛 Controls', callback_data: 'ctl:panel' }];
+        if (isDirectReply) return [controls];
+
+        const tokenless = this.config.allowTokenlessCommands === true && !isGroupChat;
+        if (tokenless) return [controls];
+
+        return [
+            [{ text: '📋 Copy /cmd', copy_text: { text: `/cmd ${token} ` } }],
+            controls
+        ];
     }
 
     /**

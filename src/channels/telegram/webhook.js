@@ -524,7 +524,7 @@ class TelegramWebhookHandler {
             const token = data.split(':')[1];
             // For backward compatibility - send help message for old callback buttons
             await this._sendMessage(chatId,
-                `📝 *How to send a command:*\n\nType:\n\`/cmd ${token} <your command>\`\n\nExample:\n\`/cmd ${token} please analyze this code\`\n\n💡 *Tip:* New notifications have a button that auto-fills the command for you!`,
+                `📝 *How to send a command:*\n\nType:\n\`/cmd ${token} <your command>\`\n\nExample:\n\`/cmd ${token} please analyze this code\`\n\n💡 *Tip:* Newer notifications carry a Copy button that puts the prefix on your clipboard.`,
                 { parse_mode: 'Markdown' });
         }
     }
