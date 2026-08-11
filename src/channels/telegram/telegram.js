@@ -10,6 +10,7 @@ const path = require('path');
 const fs = require('fs');
 const TmuxMonitor = require('../../utils/tmux-monitor');
 const { execSync } = require('child_process');
+const { toRichMarkdown, splitRichMarkdown } = require('./rich-markdown');
 
 class TelegramChannel extends NotificationChannel {
     constructor(config = {}) {
@@ -146,28 +147,77 @@ class TelegramChannel extends NotificationChannel {
                 [{ text: '🎛 Controls', callback_data: 'ctl:panel' }]
             ];
         
-        const requestData = {
-            chat_id: chatId,
-            text: messageText,
-            reply_markup: {
-                inline_keyboard: buttons
-            }
-        };
-        if (!isDirectReply) requestData.parse_mode = 'Markdown';
+        const sent = await this._sendRich(chatId, messageText, buttons);
+        if (sent) {
+            this.logger.info(`Telegram message sent successfully, Session: ${sessionId}`);
+            return true;
+        }
 
+        // Clean up failed session
+        await this._removeSession(sessionId);
+        return false;
+    }
+
+    /**
+     * Send Markdown as Telegram renders it, with plain text as the floor.
+     *
+     * `sendRichMessage` is what turns Claude's output into headings, lists,
+     * tables and highlighted code instead of a wall of asterisks, and it carries
+     * 32768 characters where a text message carries 4096. It is also newer than
+     * the rest of this channel, so a rejection falls back to plain text: a reply
+     * that arrives unstyled beats a reply that does not arrive.
+     */
+    async _sendRich(chatId, markdown, buttons) {
+        const chunks = splitRichMarkdown(toRichMarkdown(markdown));
+        if (chunks.length === 0) return true;
+
+        for (const [index, chunk] of chunks.entries()) {
+            const isLast = index === chunks.length - 1;
+            const payload = {
+                chat_id: chatId,
+                rich_message: { markdown: chunk }
+            };
+            // Buttons belong on the last piece, where the reply ends.
+            if (isLast) payload.reply_markup = { inline_keyboard: buttons };
+
+            try {
+                await axios.post(
+                    `${this.apiBaseUrl}/bot${this.config.botToken}/sendRichMessage`,
+                    payload,
+                    this._getNetworkOptions()
+                );
+            } catch (error) {
+                this.logger.warn(
+                    `Rich message rejected, falling back to plain text: ${JSON.stringify(error.response?.data?.description || error.message)}`
+                );
+                return this._sendPlain(chatId, markdown, buttons);
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * The fallback carries no parse_mode on purpose. Claude's prose is full of
+     * underscores and asterisks that Telegram's parsers reject outright, and a
+     * rejected message is a message the operator never sees.
+     */
+    async _sendPlain(chatId, text, buttons) {
+        const body = String(text);
+        const clipped = body.length > 4000 ? `${body.slice(0, 3997)}...` : body;
         try {
-            const response = await axios.post(
+            await axios.post(
                 `${this.apiBaseUrl}/bot${this.config.botToken}/sendMessage`,
-                requestData,
+                {
+                    chat_id: chatId,
+                    text: clipped,
+                    reply_markup: { inline_keyboard: buttons }
+                },
                 this._getNetworkOptions()
             );
-
-            this.logger.info(`Telegram message sent successfully, Session: ${sessionId}`);
             return true;
         } catch (error) {
             this.logger.error('Failed to send Telegram message:', error.response?.data || error.message);
-            // Clean up failed session
-            await this._removeSession(sessionId);
             return false;
         }
     }
@@ -176,51 +226,44 @@ class TelegramChannel extends NotificationChannel {
         const response = String(notification.metadata?.claudeResponse || '').trim();
         if (!response) return 'Claude finished without a text response.';
 
-        // Telegram text messages are limited to 4096 characters. Leave room
-        // for a continuation marker while keeping arbitrary Claude markdown safe.
-        return response.length > 4000 ? `${response.slice(0, 3997)}...` : response;
-    }
-
-    /**
-     * Everything interpolated below is written by someone other than this
-     * template -- a project name, a question typed on a phone, Claude's own
-     * prose cut off at 300 characters. Telegram rejects the entire message over
-     * a single unpaired `_`, so the notification would be lost rather than
-     * mis-styled. Escape after truncating: cutting first cannot split an escape
-     * pair, cutting second can.
-     */
-    _escapeMarkdown(text) {
-        return String(text).replace(/([_*`\[])/g, '\\$1');
+        // No truncation here any more: the rich limit is 32768 characters and
+        // anything longer is split between blocks rather than cut mid-sentence.
+        return response;
     }
 
     _clip(text, limit) {
         const value = String(text);
-        const clipped = value.substring(0, limit);
-        return this._escapeMarkdown(clipped) + (value.length > limit ? '...' : '');
+        return value.length > limit ? `${value.substring(0, limit)}...` : value;
     }
 
+    /**
+     * Written in rich Markdown, where `**` is bold -- legacy `*single*` means
+     * italic here. Nothing is escaped by hand: `toRichMarkdown` escapes the
+     * prose on the way out, so a project name or a quoted question cannot break
+     * the message, and the escaping happens once rather than per call site.
+     */
     _generateTelegramMessage(notification, sessionId, token) {
         const type = notification.type;
         const emoji = type === 'completed' ? '✅' : '⏳';
         const status = type === 'completed' ? 'Completed' : 'Waiting for Input';
 
-        let messageText = `${emoji} *Claude Task ${status}*\n`;
-        messageText += `*Project:* ${this._escapeMarkdown(notification.project)}\n`;
-        messageText += `*Session Token:* \`${token}\`\n\n`;
-        
+        let messageText = `${emoji} **Claude Task ${status}**\n`;
+        messageText += `**Project:** ${notification.project}\n`;
+        messageText += `**Session Token:** \`${token}\`\n\n`;
+
         if (notification.metadata) {
             if (notification.metadata.userQuestion) {
-                messageText += `📝 *Your Question:*\n${this._clip(notification.metadata.userQuestion, 200)}`;
+                messageText += `📝 **Your Question:**\n${this._clip(notification.metadata.userQuestion, 200)}`;
                 messageText += '\n\n';
             }
 
             if (notification.metadata.claudeResponse) {
-                messageText += `🤖 *Claude Response:*\n${this._clip(notification.metadata.claudeResponse, 300)}`;
+                messageText += `🤖 **Claude Response:**\n${this._clip(notification.metadata.claudeResponse, 300)}`;
                 messageText += '\n\n';
             }
         }
-        
-        messageText += `💬 *To send a new command:*\n`;
+
+        messageText += `💬 **To send a new command:**\n`;
         messageText += `Reply with: \`/cmd ${token} <your command>\`\n`;
         messageText += `Example: \`/cmd ${token} Please analyze this code\``;
 

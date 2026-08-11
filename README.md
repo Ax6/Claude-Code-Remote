@@ -331,6 +331,13 @@ INJECTION_MODE=tmux
 - Created tmux sessions use a composite name such as
   `claudio-2-existing-project`; aliases and the selected control-panel session
   persist across webhook restarts.
+- Claude's replies are sent through Telegram's rich message API, so headings,
+  lists, tables, block quotations and fenced code with syntax highlighting
+  render as themselves instead of as raw Markdown. Prose is HTML-escaped on the
+  way out (rich Markdown treats `<...>` as a tag and would drop it), code spans
+  and fences are left untouched, and single newlines are kept as line breaks.
+  The limit is 32768 characters, split between blocks rather than truncated; if
+  the API rejects a message it is resent as plain text.
 - Claude permission prompts are forwarded as Once/Always/Deny buttons.
 - Telegram shows its native typing indicator while Claude is working, and the
   Stop hook returns Claude's final response directly to the chat.
