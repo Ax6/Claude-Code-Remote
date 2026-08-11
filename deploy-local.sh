@@ -28,6 +28,7 @@ EXCLUDES=(
     --exclude 'logs/'
     --exclude 'src/data/'
     --exclude 'CLAUDE.md'
+    --exclude '.claude/'
     --exclude '.DS_Store'
 )
 
@@ -48,21 +49,36 @@ if [[ -z "$CHANGED" ]]; then
 fi
 print "$CHANGED" | sed 's/^/  /'
 
+# The itemize flags are one space-free field, so the path is everything after the
+# first space -- `awk '{print $2}'` loses every path that contains one.
+changed_paths() { print -r -- "$CHANGED" | sed 's/^[^ ]* //'; }
+created_paths() { print -r -- "$CHANGED" | grep -E '^>f\+{9}' | sed 's/^[^ ]* //' || true; }
+
 # 2. Refuse to ship a file that cannot parse: a start-up crash is the one
 #    failure the rollback window does not cover, because launchd retries it.
 #    Scoped to what is being published -- the checkout carries scripts that are
 #    broken upstream and have nothing to do with the running service, and a
 #    guard that blocks on those is a guard that gets bypassed.
 print "→ checking syntax"
-print "$CHANGED" | awk '{print $2}' | grep '\.js$' | while IFS= read -r relative; do
-    node --check "$REPO/$relative" >/dev/null 2>&1 || fail "syntax error in $relative"
-done
+# `|| true` because a deploy that touches no .js at all is normal, and grep
+# exiting 1 under pipefail used to kill the script here without saying anything.
+JS_CHANGED=$(changed_paths | grep '\.js$' || true)
+if [[ -z "$JS_CHANGED" ]]; then
+    print "  no JavaScript in this deploy"
+else
+    for relative in ${(f)JS_CHANGED}; do
+        node --check "$REPO/$relative" >/dev/null 2>&1 || fail "syntax error in $relative"
+    done
+fi
 
 # 3. Keep the files this deploy is about to overwrite, so the rollback is exact
-#    rather than a guess at what the previous version held.
+#    rather than a guess at what the previous version held. Files the deploy
+#    creates have no previous bytes to keep, so the rollback removes them
+#    instead -- restoring the backup alone would leave them behind.
 print "→ backing up to $BACKUP"
 mkdir -p "$BACKUP"
-print "$CHANGED" | awk '{print $2}' | while IFS= read -r relative; do
+CREATED=$(created_paths)
+for relative in ${(f)$(changed_paths)}; do
     [[ -f "$APP/$relative" ]] || continue
     mkdir -p "$BACKUP/$(dirname "$relative")"
     cp -p "$APP/$relative" "$BACKUP/$relative"
@@ -99,6 +115,11 @@ fi
 #    one that is down.
 print -u2 "✗ webhook did not come up; rolling back"
 rsync -r "$BACKUP/" "$APP/"
+if [[ -n "$CREATED" ]]; then
+    for relative in ${(f)CREATED}; do
+        rm -f "$APP/$relative"
+    done
+fi
 restart
 if healthy; then
     print -u2 "✓ rolled back to the previous files; webhook healthy again"

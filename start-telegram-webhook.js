@@ -53,6 +53,19 @@ const sessionAliasesFile = process.env.TELEGRAM_SESSION_ALIASES_FILE ||
     path.join(path.dirname(sessionDataDir), 'session-aliases.json');
 const selectedSessionsFile = process.env.TELEGRAM_SELECTED_SESSIONS_FILE ||
     path.join(path.dirname(sessionDataDir), 'selected-sessions.json');
+const panelAnchorsFile = process.env.TELEGRAM_PANEL_ANCHORS_FILE ||
+    path.join(path.dirname(sessionDataDir), 'panel-anchors.json');
+
+const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'auto'];
+const MODE_ALIASES = { ask: 'default', edits: 'acceptEdits', plan: 'plan', auto: 'auto' };
+
+function parseDefaultMode(value) {
+    if (!value) return 'auto';
+    const requested = MODE_ALIASES[value.trim().toLowerCase()] || value.trim();
+    if (PERMISSION_MODES.includes(requested)) return requested;
+    logger.warn(`Ignoring unknown CLAUDIO_DEFAULT_MODE '${value}'; using auto`);
+    return 'auto';
+}
 const configuredAliases = parseSessionAliases(process.env.TELEGRAM_SESSION_ALIASES);
 const savedAliases = loadSessionAliases(sessionAliasesFile);
 
@@ -70,6 +83,11 @@ const config = {
     sessionAliases: { ...configuredAliases, ...savedAliases },
     sessionAliasesFile,
     selectedSessionsFile,
+    panelAnchorsFile,
+    // Sessions opened from the phone start here. Auto is the default because a
+    // remote session with nobody at the keyboard spends its time waiting for
+    // permission answers otherwise.
+    defaultMode: parseDefaultMode(process.env.CLAUDIO_DEFAULT_MODE),
     projectsRoot: process.env.CLAUDIO_PROJECTS_ROOT || path.join(process.env.HOME || process.cwd(), 'Projects'),
     claudeCliPath: process.env.CLAUDE_CLI_PATH || 'claude'
 };
@@ -104,6 +122,7 @@ async function start() {
     logger.info(`- Default session: ${config.defaultSession}`);
     logger.info(`- Session aliases: ${Object.keys(config.sessionAliases).length > 0 ? Object.entries(config.sessionAliases).map(([alias, session]) => `${alias}:${session}`).join(', ') : 'None'}`);
     logger.info(`- Projects root: ${config.projectsRoot}`);
+    logger.info(`- Default permission mode: ${config.defaultMode}`);
 
     // Start accepting requests before the Telegram API registration call. This
     // keeps the health endpoint and an already-registered webhook available if

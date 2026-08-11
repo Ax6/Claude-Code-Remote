@@ -54,3 +54,6 @@ src/data/
 
 # Claude configuration (user-specific)
 CLAUDE.md
+
+# Screenshots relayed from Telegram; the folder also ignores itself.
+.claudio-uploads/

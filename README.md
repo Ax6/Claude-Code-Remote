@@ -318,9 +318,16 @@ INJECTION_MODE=tmux
 - Send plain text to the default session, or prefix it with a number to target
   an explicit session: `1 review the changes`.
 - `/panel` opens compact controls for session, model, effort, permission mode,
-  compact, continue, and stop.
+  compact, continue, and stop. The panel is a single message: buttons edit it in
+  place, submenus swap its keyboard, and results appear on its status line
+  instead of as new messages. Typing `/panel` moves it to the bottom of the chat.
+- Send a screenshot to have Claude look at it. The image is saved under
+  `.claudio-uploads/` inside the selected session's working directory and its
+  path is passed to Claude, with the caption as the instruction when there is
+  one. That folder ignores itself, so it stays out of the project's git status.
 - `/new 2 existing-project` starts Claude in an existing folder below
   `CLAUDIO_PROJECTS_ROOT`. Missing folders require a Create/Cancel confirmation.
+  New sessions start in `CLAUDIO_DEFAULT_MODE`, which defaults to `auto`.
 - Created tmux sessions use a composite name such as
   `claudio-2-existing-project`; aliases and the selected control-panel session
   persist across webhook restarts.

@@ -10,6 +10,12 @@ const path = require('path');
 const fs = require('fs');
 const Logger = require('../../core/logger');
 const ControllerInjector = require('../../utils/controller-injector');
+const MessageAnchor = require('./message-anchor');
+const { renderPanel, MODELS, EFFORTS, MODE_LABELS } = require('./panel-view');
+
+// Telegram serves files up to 20MB through getFile; a screenshot that large is
+// a mistake rather than a screenshot.
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
 class TelegramWebhookHandler {
     constructor(config = {}) {
@@ -28,7 +34,17 @@ class TelegramWebhookHandler {
         this.activeTelegramTasks = new Map();
         this.activityPollInterval = null;
         this.pendingSessionCreates = new Map();
-        
+        this.panelViews = new Map();
+        this.panelStatus = new Map();
+        this.panel = new MessageAnchor({
+            filePath: this.config.panelAnchorsFile,
+            logger: this.logger,
+            send: (chatId, text, options) => this._sendMessage(chatId, text, options),
+            edit: (chatId, messageId, text, options) => this._editMessageText(chatId, messageId, text, options),
+            remove: (chatId, messageId) => this._deleteMessage(chatId, messageId)
+        });
+        this.uploadsFallbackDir = path.join(__dirname, '../../data/uploads');
+
         this._setupMiddleware();
         this._setupRoutes();
     }
@@ -107,15 +123,22 @@ class TelegramWebhookHandler {
         const chatId = message.chat.id;
         const userId = message.from.id;
         const messageText = message.text?.trim();
-        
-        if (!messageText) return;
 
-        // Check if user is authorized
+        // Authorization comes before the shape of the message: the check used to
+        // sit behind an early return for anything without text, so an image from
+        // an unknown chat was dropped as silently as one from the operator.
         if (!this._isAuthorized(userId, chatId)) {
             this.logger.warn(`Unauthorized user/chat: ${userId}/${chatId}`);
             await this._sendMessage(chatId, '⚠️ You are not authorized to use this bot.');
             return;
         }
+
+        if (this._imageFrom(message)) {
+            await this._handleImageMessage(message);
+            return;
+        }
+
+        if (!messageText) return;
 
         // Handle /start command
         if (messageText === '/start') {
@@ -143,7 +166,9 @@ class TelegramWebhookHandler {
                 await this._sendTokenRequiredMessage(chatId);
                 return;
             }
-            await this._sendControlPanel(chatId);
+            // Typed, so the operator is looking at the bottom of the chat: the
+            // panel moves down to meet them instead of updating out of sight.
+            await this._sendControlPanel(chatId, '', { relocate: true });
             return;
         }
 
@@ -158,7 +183,7 @@ class TelegramWebhookHandler {
                 await this._sendTokenRequiredMessage(chatId);
                 return;
             }
-            await this._sendControlSubmenu(chatId, submenuCommands[messageText]);
+            await this._sendControlSubmenu(chatId, submenuCommands[messageText], { relocate: true });
             return;
         }
 
@@ -168,7 +193,8 @@ class TelegramWebhookHandler {
                 await this._sendTokenRequiredMessage(chatId);
                 return;
             }
-            await this._runPanelCommand(chatId, `/model ${directModel[1].toLowerCase()}`, 'model');
+            const model = directModel[1].toLowerCase();
+            await this._runPanelCommand(chatId, `/model ${model}`, 'model', model, { relocate: true });
             return;
         }
 
@@ -178,7 +204,8 @@ class TelegramWebhookHandler {
                 await this._sendTokenRequiredMessage(chatId);
                 return;
             }
-            await this._runPanelCommand(chatId, `/effort ${directEffort[1].toLowerCase()}`, 'effort');
+            const effort = directEffort[1].toLowerCase();
+            await this._runPanelCommand(chatId, `/effort ${effort}`, 'effort', `effort ${effort}`, { relocate: true });
             return;
         }
 
@@ -188,7 +215,7 @@ class TelegramWebhookHandler {
                 await this._sendTokenRequiredMessage(chatId);
                 return;
             }
-            await this._selectPanelSession(chatId, directSession[1].toLowerCase());
+            await this._selectPanelSession(chatId, directSession[1].toLowerCase(), { relocate: true });
             return;
         }
 
@@ -199,7 +226,7 @@ class TelegramWebhookHandler {
                 return;
             }
             const modes = { ask: 'default', edits: 'acceptEdits', plan: 'plan', auto: 'auto' };
-            await this._setPanelMode(chatId, modes[directMode[1].toLowerCase()]);
+            await this._setPanelMode(chatId, modes[directMode[1].toLowerCase()], { relocate: true });
             return;
         }
 
@@ -266,6 +293,111 @@ class TelegramWebhookHandler {
         await this._sendHelpMessage(chatId);
     }
 
+    /**
+     * The image in a message, if there is one.
+     *
+     * Photos arrive as a ladder of sizes and the last entry is the largest, which
+     * is the only one worth reading. A screenshot sent as a file arrives as a
+     * document instead, with the same content and no `photo` array at all.
+     */
+    _imageFrom(message) {
+        if (Array.isArray(message.photo) && message.photo.length > 0) {
+            const largest = message.photo[message.photo.length - 1];
+            return { fileId: largest.file_id, fileSize: largest.file_size, name: null };
+        }
+        const document = message.document;
+        if (document && typeof document.mime_type === 'string' && document.mime_type.startsWith('image/')) {
+            return { fileId: document.file_id, fileSize: document.file_size, name: document.file_name };
+        }
+        return null;
+    }
+
+    async _handleImageMessage(message) {
+        const chatId = message.chat.id;
+        if (!this._canUseTokenlessCommands(chatId)) {
+            await this._sendTokenRequiredMessage(chatId);
+            return;
+        }
+
+        const image = this._imageFrom(message);
+        const session = this._getPanelSession(chatId);
+        let savedPath;
+        try {
+            savedPath = await this._saveImageForSession(image, session);
+        } catch (error) {
+            this.logger.error('Image download failed:', error.message);
+            await this._sendMessage(chatId, `❌ Could not save the image: ${error.message}`);
+            return;
+        }
+
+        // Claude reads images from disk, so what travels through tmux is the
+        // path. The caption is the instruction when there is one.
+        const caption = message.caption?.trim();
+        const prompt = caption ? `${caption}\n${savedPath}` : `Look at this image: ${savedPath}`;
+        const result = await this._processSessionCommand(chatId, session, prompt, 'image');
+        if (result.ok) {
+            await this._renderPanel(chatId, { status: `🖼 ${path.basename(savedPath)}` });
+        }
+    }
+
+    async _saveImageForSession(image, session) {
+        if (image.fileSize && image.fileSize > MAX_IMAGE_BYTES) {
+            throw new Error(`image is larger than ${Math.round(MAX_IMAGE_BYTES / (1024 * 1024))}MB`);
+        }
+
+        const file = await this._downloadTelegramFile(image.fileId);
+        const extension = (path.extname(image.name || '') || path.extname(file.remoteName) || '.jpg')
+            .toLowerCase()
+            .replace(/[^.a-z0-9]/g, '');
+        const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+$/, '').replace('T', '-');
+        const name = `${stamp}-${crypto.randomBytes(2).toString('hex')}${extension || '.jpg'}`;
+        const directory = this._uploadDirectory(session);
+        const target = path.join(directory, name);
+        fs.writeFileSync(target, file.buffer, { mode: 0o600 });
+        this.logger.info(`Image saved for session '${session}': ${target}`);
+        return target;
+    }
+
+    /**
+     * Uploads land next to the code the session is working on, because a path
+     * inside the working directory is one Claude can read without asking. The
+     * folder ignores itself so it never shows up in the project's git status.
+     */
+    _uploadDirectory(session) {
+        const info = this.injector.getSessionInfo(session);
+        const base = info.cwd && fs.existsSync(info.cwd) ? info.cwd : this.uploadsFallbackDir;
+        const directory = path.join(base, '.claudio-uploads');
+        fs.mkdirSync(directory, { recursive: true });
+        const ignore = path.join(directory, '.gitignore');
+        if (!fs.existsSync(ignore)) fs.writeFileSync(ignore, '*\n');
+        return directory;
+    }
+
+    async _downloadTelegramFile(fileId) {
+        const lookup = await axios.get(
+            `${this.apiBaseUrl}/bot${this.config.botToken}/getFile`,
+            { ...this._getNetworkOptions(), params: { file_id: fileId } }
+        );
+        const remotePath = lookup.data?.result?.file_path;
+        if (!remotePath) throw new Error('Telegram returned no file path');
+        if (lookup.data.result.file_size > MAX_IMAGE_BYTES) {
+            throw new Error(`image is larger than ${Math.round(MAX_IMAGE_BYTES / (1024 * 1024))}MB`);
+        }
+
+        const download = await axios.get(
+            `${this.apiBaseUrl}/file/bot${this.config.botToken}/${remotePath}`,
+            {
+                ...this._getNetworkOptions(),
+                // A photo is bigger than an API reply, and both limits here are
+                // about not hanging on a slow phone upload.
+                timeout: 30000,
+                maxContentLength: MAX_IMAGE_BYTES,
+                responseType: 'arraybuffer'
+            }
+        );
+        return { buffer: Buffer.from(download.data), remoteName: path.basename(remotePath) };
+    }
+
     _canUseTokenlessCommands(chatId) {
         return this.config.allowTokenlessCommands === true &&
             Boolean(this.config.chatId) &&
@@ -280,15 +412,22 @@ class TelegramWebhookHandler {
     }
 
     async _processSessionCommand(chatId, sessionName, command, routeLabel) {
+        // Panel routes report through the panel's own status line, so they must
+        // not also post a message of their own -- that was half the pile-up.
+        const isPanelRoute = routeLabel.startsWith('panel ');
         try {
             await this.injector.injectCommand(command, sessionName);
-            if (!routeLabel.startsWith('panel ')) {
+            if (!isPanelRoute) {
                 await this._markTelegramTaskActive(chatId, sessionName);
             }
             this.logger.info(`Command injected - User: ${chatId}, Session: ${sessionName}, Route: ${routeLabel}, Command: ${command}`);
+            return { ok: true };
         } catch (error) {
             this.logger.error('Command injection failed:', error.message);
-            await this._sendMessage(chatId, `❌ Command execution failed: ${error.message}`);
+            if (!isPanelRoute) {
+                await this._sendMessage(chatId, `❌ Command execution failed: ${error.message}`);
+            }
+            return { ok: false, error: error.message };
         }
     }
 
@@ -348,93 +487,19 @@ class TelegramWebhookHandler {
             return;
         }
 
-        if (data.startsWith('ctl:o:')) {
-            await this._handleModeCallback(callbackQuery);
-            return;
-        }
-
         if (data.startsWith('new:')) {
             await this._handleNewSessionCallback(callbackQuery);
             return;
         }
-        
+
+        if (data.startsWith('ctl:')) {
+            await this._handleControlCallback(callbackQuery);
+            return;
+        }
+
         // Answer callback query to remove loading state
         await this._answerCallbackQuery(callbackQuery.id);
 
-        if (data === 'ctl:panel') {
-            if (!this._canUseTokenlessCommands(chatId)) {
-                await this._sendTokenRequiredMessage(chatId);
-                return;
-            }
-            await this._sendControlPanel(chatId);
-            return;
-        }
-
-        if (data.startsWith('ctl:v:')) {
-            if (!this._canUseTokenlessCommands(chatId)) {
-                await this._sendTokenRequiredMessage(chatId);
-                return;
-            }
-            await this._sendControlSubmenu(chatId, data.slice('ctl:v:'.length));
-            return;
-        }
-
-        if (data === 'ctl:new') {
-            await this._sendNewSessionHelp(chatId);
-            return;
-        }
-
-        if (data.startsWith('ctl:s:')) {
-            if (!this._canUseTokenlessCommands(chatId)) {
-                await this._sendTokenRequiredMessage(chatId);
-                return;
-            }
-            await this._selectPanelSession(chatId, data.slice('ctl:s:'.length));
-            return;
-        }
-
-        if (data.startsWith('ctl:m:')) {
-            if (!this._canUseTokenlessCommands(chatId)) {
-                await this._sendTokenRequiredMessage(chatId);
-                return;
-            }
-            const model = data.slice('ctl:m:'.length);
-            if (!['sonnet', 'opus', 'haiku'].includes(model)) return;
-            await this._runPanelCommand(chatId, `/model ${model}`, 'model');
-            return;
-        }
-
-        if (data.startsWith('ctl:e:')) {
-            if (!this._canUseTokenlessCommands(chatId)) {
-                await this._sendTokenRequiredMessage(chatId);
-                return;
-            }
-            const effort = data.slice('ctl:e:'.length);
-            if (!['auto', 'low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) return;
-            await this._runPanelCommand(chatId, `/effort ${effort}`, 'effort');
-            return;
-        }
-
-        if (data.startsWith('ctl:a:')) {
-            if (!this._canUseTokenlessCommands(chatId)) {
-                await this._sendTokenRequiredMessage(chatId);
-                return;
-            }
-            const action = data.slice('ctl:a:'.length);
-            const commands = {
-                continue: 'continue',
-                compact: '/compact'
-            };
-            if (action === 'stop') {
-                await this._runPanelKey(chatId, 'C-c', 'stop');
-            } else if (action === 'status') {
-                await this._sendSessionStatus(chatId);
-            } else if (commands[action]) {
-                await this._runPanelCommand(chatId, commands[action], action);
-            }
-            return;
-        }
-        
         if (data.startsWith('personal:')) {
             const token = data.split(':')[1];
             // Send personal chat command format
@@ -502,22 +567,142 @@ class TelegramWebhookHandler {
         return alias ? `${alias} · ${folder}` : `Default · ${folder}`;
     }
 
-    async _selectPanelSession(chatId, selector) {
+    async _handleControlCallback(callbackQuery) {
+        const chatId = callbackQuery.message.chat.id;
+        const data = callbackQuery.data;
+
+        if (!this._canUseTokenlessCommands(chatId)) {
+            await this._answerCallbackQuery(callbackQuery.id, 'Not authorized');
+            return;
+        }
+
+        // A Controls button on a notification is not the panel, so it opens one
+        // at the bottom of the chat rather than editing a bubble further up.
+        if (data === 'ctl:panel') {
+            await this._answerCallbackQuery(callbackQuery.id);
+            await this._sendControlPanel(chatId, '', { relocate: true });
+            return;
+        }
+
+        // Every other control is on the panel itself: the message that carried
+        // the button is the message that keeps being edited, even if the stored
+        // anchor was lost in between.
+        this.panel.adopt(chatId, callbackQuery.message.message_id);
+
+        if (data.startsWith('ctl:v:')) {
+            await this._answerCallbackQuery(callbackQuery.id);
+            await this._sendControlSubmenu(chatId, data.slice('ctl:v:'.length));
+            return;
+        }
+
+        if (data === 'ctl:new') {
+            await this._answerCallbackQuery(callbackQuery.id);
+            await this._sendNewSessionHelp(chatId);
+            return;
+        }
+
+        if (data.startsWith('ctl:s:')) {
+            const selector = data.slice('ctl:s:'.length);
+            const sessionName = await this._selectPanelSession(chatId, selector);
+            await this._answerCallbackQuery(
+                callbackQuery.id,
+                sessionName ? `Session: ${selector}` : `Unknown session: ${selector}`
+            );
+            return;
+        }
+
+        if (data.startsWith('ctl:m:')) {
+            const model = data.slice('ctl:m:'.length);
+            if (!MODELS.includes(model)) {
+                await this._answerCallbackQuery(callbackQuery.id, 'Invalid model');
+                return;
+            }
+            const result = await this._runPanelCommand(chatId, `/model ${model}`, 'model', model);
+            await this._answerToast(callbackQuery.id, result, `Model: ${model}`);
+            return;
+        }
+
+        if (data.startsWith('ctl:e:')) {
+            const effort = data.slice('ctl:e:'.length);
+            if (!EFFORTS.includes(effort)) {
+                await this._answerCallbackQuery(callbackQuery.id, 'Invalid effort');
+                return;
+            }
+            const result = await this._runPanelCommand(chatId, `/effort ${effort}`, 'effort', `effort ${effort}`);
+            await this._answerToast(callbackQuery.id, result, `Effort: ${effort}`);
+            return;
+        }
+
+        if (data.startsWith('ctl:o:')) {
+            const mode = data.slice('ctl:o:'.length);
+            if (!MODE_LABELS[mode]) {
+                await this._answerCallbackQuery(callbackQuery.id, 'Invalid mode');
+                return;
+            }
+            const result = await this._setPanelMode(chatId, mode);
+            await this._answerToast(callbackQuery.id, result, `Mode: ${MODE_LABELS[mode]}`);
+            return;
+        }
+
+        if (data.startsWith('ctl:a:')) {
+            const action = data.slice('ctl:a:'.length);
+            const commands = { continue: 'continue', compact: '/compact' };
+            if (action === 'stop') {
+                const result = await this._runPanelKey(chatId, 'C-c', 'stop');
+                await this._answerToast(callbackQuery.id, result, 'Stopped');
+            } else if (action === 'status') {
+                await this._answerCallbackQuery(callbackQuery.id);
+                await this._showSessionStatus(chatId);
+            } else if (commands[action]) {
+                const result = await this._runPanelCommand(chatId, commands[action], action, action);
+                await this._answerToast(callbackQuery.id, result, `Sent: ${action}`);
+            } else {
+                await this._answerCallbackQuery(callbackQuery.id);
+            }
+            return;
+        }
+
+        await this._answerCallbackQuery(callbackQuery.id);
+    }
+
+    async _answerToast(callbackQueryId, result, successText) {
+        // Callback answers are capped at 200 characters by Telegram.
+        const text = result.ok ? successText : `❌ ${result.error}`.slice(0, 190);
+        await this._answerCallbackQuery(callbackQueryId, text);
+    }
+
+    async _selectPanelSession(chatId, selector, options = {}) {
         const sessionName = selector === 'default'
             ? this.config.defaultSession
             : this.config.sessionAliases?.[selector];
         if (!sessionName) {
-            await this._sendMessage(chatId, `❌ Unknown session alias: ${selector}`);
-            return;
+            await this._renderPanel(chatId, {
+                view: 'session',
+                status: `❌ Unknown session alias: ${selector}`,
+                ...options
+            });
+            return null;
         }
         this.selectedSessions.set(String(chatId), sessionName);
         this._persistSelectedSessions();
-        await this._sendControlPanel(chatId, `✅ Selected session: ${sessionName}`);
+        // Selecting is the one action that leaves the submenu: the point of
+        // picking a session is to act on it.
+        await this._renderPanel(chatId, {
+            view: 'root',
+            status: `✅ ${this._getSessionDisplayName(sessionName)}`,
+            ...options
+        });
+        return sessionName;
     }
 
-    async _runPanelCommand(chatId, command, action) {
+    async _runPanelCommand(chatId, command, action, label = action, options = {}) {
         const sessionName = this._getPanelSession(chatId);
-        await this._processSessionCommand(chatId, sessionName, command, `panel ${action}`);
+        const result = await this._processSessionCommand(chatId, sessionName, command, `panel ${action}`);
+        await this._renderPanel(chatId, {
+            status: result.ok ? `✅ ${label}` : `❌ ${result.error}`,
+            ...options
+        });
+        return result;
     }
 
     async _runPanelKey(chatId, key, action) {
@@ -525,103 +710,68 @@ class TelegramWebhookHandler {
         try {
             this.injector.sendKey(key, sessionName);
             this.logger.info(`Control action injected - User: ${chatId}, Session: ${sessionName}, Action: ${action}`);
+            await this._renderPanel(chatId, { status: `✅ ${action}` });
+            return { ok: true };
         } catch (error) {
             this.logger.error('Control key injection failed:', error.message);
-            await this._sendMessage(chatId, `❌ ${action} failed: ${error.message}`);
+            await this._renderPanel(chatId, { status: `❌ ${action}: ${error.message}` });
+            return { ok: false, error: error.message };
         }
     }
 
-    async _sendControlPanel(chatId, prefix = '') {
+    async _sendControlPanel(chatId, status = '', options = {}) {
+        await this._renderPanel(chatId, { view: 'root', status, ...options });
+    }
+
+    async _sendControlSubmenu(chatId, view, options = {}) {
+        if (!['root', 'model', 'effort', 'session', 'mode'].includes(view)) return;
+        await this._renderPanel(chatId, { view, ...options });
+    }
+
+    /**
+     * The single place the panel reaches Telegram.
+     *
+     * `view` and `status` are remembered per chat, so a caller that only has an
+     * outcome to report ("✅ opus") re-renders whatever view the operator is
+     * looking at instead of resetting them to the root.
+     */
+    async _renderPanel(chatId, { view, status, relocate = false } = {}) {
+        const key = String(chatId);
+        if (view) this.panelViews.set(key, view);
+        if (status !== undefined) {
+            this.panelStatus.set(key, status ? `${status} · ${this._clock()}` : '');
+        }
+
+        const current = this.panelViews.get(key) || 'root';
         const selected = this._getPanelSession(chatId);
-        const selectedLabel = this._getSessionDisplayName(selected);
-        const rows = [
-            [
-                { text: '🖥 Session', callback_data: 'ctl:v:session' },
-                { text: '🤖 Model', callback_data: 'ctl:v:model' },
-                { text: '🧠 Effort', callback_data: 'ctl:v:effort' },
-                { text: '🛡 Mode', callback_data: 'ctl:v:mode' }
-            ],
-            [
-                { text: '▶️ Continue', callback_data: 'ctl:a:continue' },
-                { text: '🧹 Compact', callback_data: 'ctl:a:compact' },
-                { text: '⏹ Stop', callback_data: 'ctl:a:stop' }
-            ]
+        await this.panel.render(chatId, renderPanel({
+            view: current,
+            sessionLabel: this._getSessionDisplayName(selected),
+            status: this.panelStatus.get(key) || '',
+            sessions: current === 'session' ? this._panelSessionButtons(selected) : [],
+            // Read live, and only where it is shown: the footer it comes from
+            // costs a tmux capture and can change outside Telegram.
+            activeMode: current === 'mode' ? this.injector.getPermissionMode(selected) : null
+        }), { relocate });
+    }
+
+    _panelSessionButtons(selected) {
+        return [
+            {
+                selector: 'default',
+                label: this._getSessionDisplayName(this.config.defaultSession),
+                active: this.config.defaultSession === selected
+            },
+            ...Object.entries(this.config.sessionAliases || {}).map(([alias, session]) => ({
+                selector: alias,
+                label: this._getSessionDisplayName(session),
+                active: session === selected
+            }))
         ];
-
-        const heading = prefix ? `${prefix}\n\n` : '';
-        await this._sendMessage(
-            chatId,
-            `${heading}🎛 ${selectedLabel}`,
-            { reply_markup: { inline_keyboard: rows } }
-        );
     }
 
-    async _sendControlSubmenu(chatId, view) {
-        const selected = this._getPanelSession(chatId);
-        const selectedLabel = this._getSessionDisplayName(selected);
-        let title;
-        let rows;
-
-        if (view === 'model') {
-            title = `🤖 Model · ${selectedLabel}`;
-            rows = [[
-                { text: 'Sonnet', callback_data: 'ctl:m:sonnet' },
-                { text: 'Opus', callback_data: 'ctl:m:opus' },
-                { text: 'Haiku', callback_data: 'ctl:m:haiku' }
-            ]];
-        } else if (view === 'effort') {
-            title = `🧠 Effort · ${selectedLabel}`;
-            rows = [
-                [
-                    { text: 'Auto', callback_data: 'ctl:e:auto' },
-                    { text: 'Low', callback_data: 'ctl:e:low' },
-                    { text: 'Medium', callback_data: 'ctl:e:medium' }
-                ],
-                [
-                    { text: 'High', callback_data: 'ctl:e:high' },
-                    { text: 'XHigh', callback_data: 'ctl:e:xhigh' },
-                    { text: 'Max', callback_data: 'ctl:e:max' }
-                ]
-            ];
-        } else if (view === 'session') {
-            title = `🖥 Session · ${selectedLabel}`;
-            const buttons = [
-                { text: 'Default', callback_data: 'ctl:s:default' },
-                ...Object.entries(this.config.sessionAliases || {}).map(([alias, session]) => {
-                    const info = this.injector.getSessionInfo(session);
-                    let folder = info.cwd ? path.basename(info.cwd) : '';
-                    const prefix = `claudio-${alias}-`;
-                    if (!folder && session.startsWith(prefix)) folder = session.slice(prefix.length);
-                    if (!folder) folder = session;
-                    return {
-                        text: `${alias} · ${folder}`,
-                        callback_data: `ctl:s:${alias}`
-                    };
-                }),
-                { text: '➕ New', callback_data: 'ctl:new' }
-            ];
-            rows = [];
-            for (let i = 0; i < buttons.length; i += 3) {
-                rows.push(buttons.slice(i, i + 3));
-            }
-        } else if (view === 'mode') {
-            title = `🛡 Mode · ${selectedLabel}`;
-            const activeMode = this.injector.getPermissionMode(selected);
-            const modes = [
-                ['Ask', 'default'],
-                ['Edits', 'acceptEdits'],
-                ['Plan', 'plan'],
-                ['Auto', 'auto']
-            ];
-            rows = [modes.map(([label, mode]) => ({
-                text: `${activeMode === mode ? '✓ ' : ''}${label}`,
-                callback_data: `ctl:o:${mode}`
-            }))];
-        } else {
-            return;
-        }
-
-        await this._sendMessage(chatId, title, { reply_markup: { inline_keyboard: rows } });
+    _clock() {
+        return new Date().toTimeString().slice(0, 5);
     }
 
     _listProjects() {
@@ -736,21 +886,29 @@ class TelegramWebhookHandler {
                 }
             }
 
+            // A session opened from the phone is a session nobody is sitting in
+            // front of, so it starts in the configured mode rather than in
+            // whatever Claude last remembered for that folder.
+            let modeNote = '';
+            if (created && this.config.defaultMode) {
+                try {
+                    await this.injector.selectPermissionMode(this.config.defaultMode, sessionName);
+                    modeNote = ` · ${MODE_LABELS[this.config.defaultMode]}`;
+                } catch (error) {
+                    this.logger.warn(`Could not set the default mode on ${sessionName}: ${error.message}`);
+                    modeNote = ' · mode unchanged';
+                }
+            }
+
             this.config.sessionAliases[alias] = sessionName;
             this._persistSessionAliases();
             this.selectedSessions.set(String(chatId), sessionName);
             this._persistSelectedSessions();
-            await this._sendMessage(
-                chatId,
-                `✅ ${alias} · ${projectLabel}`,
-                {
-                    reply_markup: {
-                        inline_keyboard: [[
-                            { text: '🎛 Controls', callback_data: 'ctl:panel' }
-                        ]]
-                    }
-                }
-            );
+            await this._renderPanel(chatId, {
+                view: 'root',
+                status: `✅ ${alias} · ${projectLabel}${modeNote}`,
+                relocate: true
+            });
             this.logger.info(`Session alias created - User: ${chatId}, Alias: ${alias}, Session: ${sessionName}, Project: ${projectLabel}`);
             return true;
         } catch (error) {
@@ -838,45 +996,24 @@ class TelegramWebhookHandler {
         fs.renameSync(temporary, filePath);
     }
 
-    async _setPanelMode(chatId, mode) {
+    async _setPanelMode(chatId, mode, options = {}) {
         const session = this._getPanelSession(chatId);
         try {
             await this.injector.selectPermissionMode(mode, session);
-            return mode;
+            await this._renderPanel(chatId, { status: `✅ ${MODE_LABELS[mode]}`, ...options });
+            return { ok: true };
         } catch (error) {
             this.logger.error('Permission mode change failed:', error.message);
-            await this._sendMessage(chatId, `❌ ${error.message}`);
-            return null;
+            await this._renderPanel(chatId, { status: `❌ ${error.message}`, ...options });
+            return { ok: false, error: error.message };
         }
     }
 
-    async _handleModeCallback(callbackQuery) {
-        const chatId = callbackQuery.message.chat.id;
-        if (!this._canUseTokenlessCommands(chatId)) {
-            await this._answerCallbackQuery(callbackQuery.id, 'Not authorized');
-            return;
-        }
-
-        const mode = callbackQuery.data.slice('ctl:o:'.length);
-        if (!['default', 'acceptEdits', 'plan', 'auto'].includes(mode)) {
-            await this._answerCallbackQuery(callbackQuery.id, 'Invalid mode');
-            return;
-        }
-
-        const changed = await this._setPanelMode(chatId, mode);
-        const labels = { default: 'Ask', acceptEdits: 'Edits', plan: 'Plan', auto: 'Auto' };
-        await this._answerCallbackQuery(
-            callbackQuery.id,
-            changed ? `Mode: ${labels[changed]}` : 'Mode change failed'
-        );
-    }
-
-    async _sendSessionStatus(chatId) {
+    async _showSessionStatus(chatId) {
         const info = this.injector.getSessionInfo(this._getPanelSession(chatId));
-        const text = info.running
-            ? `🟢 ${info.session}\n${info.cwd}\n${info.command}`
-            : `🔴 ${info.session} is not running`;
-        await this._sendMessage(chatId, text);
+        await this._renderPanel(chatId, {
+            status: info.running ? `🟢 ${info.cwd}` : `🔴 ${info.session} is not running`
+        });
     }
 
     _startPermissionMonitor() {
@@ -1134,7 +1271,7 @@ class TelegramWebhookHandler {
 
     async _sendMessage(chatId, text, options = {}) {
         try {
-            await axios.post(
+            const response = await axios.post(
                 `${this.apiBaseUrl}/bot${this.config.botToken}/sendMessage`,
                 {
                     chat_id: chatId,
@@ -1143,8 +1280,10 @@ class TelegramWebhookHandler {
                 },
                 this._getNetworkOptions()
             );
+            return response.data?.result?.message_id ?? null;
         } catch (error) {
             this.logger.error('Failed to send message:', error.response?.data || error.message);
+            return null;
         }
     }
 
@@ -1160,7 +1299,12 @@ class TelegramWebhookHandler {
         }
     }
 
-    async _editMessageText(chatId, messageId, text) {
+    /**
+     * @returns {Promise<{ok: boolean, gone?: boolean}>} `gone` means the message
+     * cannot be edited any more, so the caller should send a new one instead of
+     * retrying into a message that no longer exists.
+     */
+    async _editMessageText(chatId, messageId, text, options = { reply_markup: { inline_keyboard: [] } }) {
         try {
             await axios.post(
                 `${this.apiBaseUrl}/bot${this.config.botToken}/editMessageText`,
@@ -1168,12 +1312,34 @@ class TelegramWebhookHandler {
                     chat_id: chatId,
                     message_id: messageId,
                     text,
-                    reply_markup: { inline_keyboard: [] }
+                    ...options
                 },
                 this._getNetworkOptions()
             );
+            return { ok: true };
         } catch (error) {
-            this.logger.error('Failed to edit Telegram message:', error.response?.data || error.message);
+            const description = error.response?.data?.description || error.message || '';
+            // Re-rendering an unchanged panel is normal: the operator can press
+            // the button for the view they are already looking at.
+            if (/message is not modified/i.test(description)) return { ok: true };
+            const gone = /message to edit not found|message can't be edited|MESSAGE_ID_INVALID|message identifier is not specified/i
+                .test(description);
+            this.logger.warn(`Failed to edit Telegram message: ${description}`);
+            return { ok: false, gone };
+        }
+    }
+
+    async _deleteMessage(chatId, messageId) {
+        try {
+            await axios.post(
+                `${this.apiBaseUrl}/bot${this.config.botToken}/deleteMessage`,
+                { chat_id: chatId, message_id: messageId },
+                this._getNetworkOptions()
+            );
+        } catch (error) {
+            // Already gone, or older than Telegram's delete window: either way
+            // the anchor is being replaced, so there is nothing to recover.
+            this.logger.debug('Could not delete Telegram message:', error.response?.data?.description || error.message);
         }
     }
 

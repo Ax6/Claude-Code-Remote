@@ -160,13 +160,51 @@ class ControllerInjector {
         }
     }
 
+    /**
+     * The pane as the user sees it, with no scrollback.
+     *
+     * Mode detection reads a footer hint that Claude repaints on every mode
+     * change, so the same words are all over the history: matching against
+     * scrollback reports whichever mode the session used to be in.
+     */
+    captureVisible(sessionName = null, lines = 8) {
+        const session = sessionName || this.defaultSession;
+        if (this.mode !== 'tmux') return '';
+
+        try {
+            const visible = execFileSync(
+                'tmux',
+                ['capture-pane', '-p', '-t', session],
+                { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+            );
+            return visible.split('\n').filter(line => line.trim()).slice(-lines).join('\n');
+        } catch (error) {
+            return '';
+        }
+    }
+
     getPermissionMode(sessionName = null) {
-        const pane = this.capturePane(sessionName, 30);
-        if (/accept edits on/i.test(pane)) return 'acceptEdits';
-        if (/plan mode on/i.test(pane)) return 'plan';
-        if (/auto mode on/i.test(pane)) return 'auto';
-        if (/manual mode on/i.test(pane)) return 'default';
+        const footer = this.captureVisible(sessionName);
+        if (!footer) return null;
+        if (/accept edits on/i.test(footer)) return 'acceptEdits';
+        if (/plan mode on/i.test(footer)) return 'plan';
+        if (/auto mode on/i.test(footer)) return 'auto';
+        if (/manual mode on/i.test(footer)) return 'default';
+        // Ask mode paints no hint once the transient one fades, so an input box
+        // with no hint is Ask -- not an unreadable session. Reporting it as
+        // unreadable is what made a mode change on an idle session fail with
+        // "not at an input prompt".
+        if (this.isAtInputPrompt(footer)) return 'default';
         return null;
+    }
+
+    isAtInputPrompt(footer = null) {
+        const visible = footer === null ? this.captureVisible() : footer;
+        // Only Claude's own prompt glyph and its cycle hint count. A bare '>' is
+        // ordinary output -- a diff, a quote, a shell transcript -- and reading
+        // that as an input prompt would start cycling modes on a session that is
+        // not showing one.
+        return /(^|\n)\s*❯/.test(visible) || /shift\+tab to cycle/i.test(visible);
     }
 
     async selectPermissionMode(targetMode, sessionName = null) {
@@ -180,14 +218,28 @@ class ControllerInjector {
         }
 
         if (!this.getPermissionMode(session)) {
-            throw new Error(`Claude session '${session}' is not at an input prompt`);
+            // Say which of the two things actually went wrong. The old message
+            // blamed the input prompt for every unreadable footer, including a
+            // session that was simply not running.
+            if (!this.getSessionInfo(session).running) {
+                throw new Error(`Claude session '${session}' is not running`);
+            }
+            throw new Error(`Could not read the permission mode of '${session}'`);
         }
 
-        for (let attempt = 0; attempt < 5; attempt++) {
+        // Four modes plus slack for a repaint that lands between two reads.
+        let unreadable = 0;
+        for (let attempt = 0; attempt < 8; attempt++) {
             const currentMode = this.getPermissionMode(session);
             if (currentMode === targetMode) return targetMode;
             if (!currentMode) {
-                throw new Error(`Claude session '${session}' is not ready for a mode change`);
+                // Mid-repaint the footer can come back empty; that is a reason
+                // to look again, not to give up on the change.
+                if (++unreadable > 2) {
+                    throw new Error(`Could not read the permission mode of '${session}'`);
+                }
+                await new Promise(resolve => setTimeout(resolve, 250));
+                continue;
             }
 
             try {
