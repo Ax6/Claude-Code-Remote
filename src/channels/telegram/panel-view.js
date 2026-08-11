@@ -8,7 +8,7 @@
  * and `MessageAnchor` is what decides which message it lands in.
  */
 
-const MODELS = ['sonnet', 'opus', 'haiku'];
+const MODELS = ['sonnet', 'opus', 'haiku', 'fable'];
 const EFFORTS = ['auto', 'low', 'medium', 'high', 'xhigh', 'max'];
 const MODES = [
     { label: 'Ask', mode: 'default' },

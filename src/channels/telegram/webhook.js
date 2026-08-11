@@ -17,6 +17,12 @@ const { renderPanel, MODELS, EFFORTS, MODE_LABELS } = require('./panel-view');
 // a mistake rather than a screenshot.
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
+// Typed commands accept exactly what the buttons offer. Built from the same
+// lists the keyboard is built from, because a model added in one place and
+// forgotten in the other is how Fable went missing from the panel.
+const TYPED_MODEL = new RegExp(`^/model\\s+(${MODELS.join('|')})$`, 'i');
+const TYPED_EFFORT = new RegExp(`^/effort\\s+(${EFFORTS.join('|')})$`, 'i');
+
 class TelegramWebhookHandler {
     constructor(config = {}) {
         this.config = config;
@@ -187,7 +193,7 @@ class TelegramWebhookHandler {
             return;
         }
 
-        const directModel = messageText.match(/^\/model\s+(sonnet|opus|haiku)$/i);
+        const directModel = messageText.match(TYPED_MODEL);
         if (directModel) {
             if (!this._canUseTokenlessCommands(chatId)) {
                 await this._sendTokenRequiredMessage(chatId);
@@ -198,7 +204,7 @@ class TelegramWebhookHandler {
             return;
         }
 
-        const directEffort = messageText.match(/^\/effort\s+(auto|low|medium|high|xhigh|max)$/i);
+        const directEffort = messageText.match(TYPED_EFFORT);
         if (directEffort) {
             if (!this._canUseTokenlessCommands(chatId)) {
                 await this._sendTokenRequiredMessage(chatId);
@@ -1189,8 +1195,8 @@ class TelegramWebhookHandler {
             `• \`/start\` - Welcome message\n` +
             `• \`/help\` - Show this help\n` +
             `• \`/panel\` - Open session, model and action buttons\n` +
-            `• \`/model <sonnet|opus|haiku>\` - Select a model\n` +
-            `• \`/effort <auto|low|medium|high|xhigh|max>\` - Set reasoning effort\n` +
+            `• \`/model <${MODELS.join('|')}>\` - Select a model\n` +
+            `• \`/effort <${EFFORTS.join('|')}>\` - Set reasoning effort\n` +
             `• \`/mode <ask|edits|plan|auto>\` - Set permission mode\n` +
             `• \`/session <alias>\` - Select the panel session\n` +
             `• \`/new <alias> <project>\` - Open an existing project in a new session\n` +
