@@ -181,29 +181,41 @@ class TelegramChannel extends NotificationChannel {
         return response.length > 4000 ? `${response.slice(0, 3997)}...` : response;
     }
 
+    /**
+     * Everything interpolated below is written by someone other than this
+     * template -- a project name, a question typed on a phone, Claude's own
+     * prose cut off at 300 characters. Telegram rejects the entire message over
+     * a single unpaired `_`, so the notification would be lost rather than
+     * mis-styled. Escape after truncating: cutting first cannot split an escape
+     * pair, cutting second can.
+     */
+    _escapeMarkdown(text) {
+        return String(text).replace(/([_*`\[])/g, '\\$1');
+    }
+
+    _clip(text, limit) {
+        const value = String(text);
+        const clipped = value.substring(0, limit);
+        return this._escapeMarkdown(clipped) + (value.length > limit ? '...' : '');
+    }
+
     _generateTelegramMessage(notification, sessionId, token) {
         const type = notification.type;
         const emoji = type === 'completed' ? '✅' : '⏳';
         const status = type === 'completed' ? 'Completed' : 'Waiting for Input';
-        
+
         let messageText = `${emoji} *Claude Task ${status}*\n`;
-        messageText += `*Project:* ${notification.project}\n`;
+        messageText += `*Project:* ${this._escapeMarkdown(notification.project)}\n`;
         messageText += `*Session Token:* \`${token}\`\n\n`;
         
         if (notification.metadata) {
             if (notification.metadata.userQuestion) {
-                messageText += `📝 *Your Question:*\n${notification.metadata.userQuestion.substring(0, 200)}`;
-                if (notification.metadata.userQuestion.length > 200) {
-                    messageText += '...';
-                }
+                messageText += `📝 *Your Question:*\n${this._clip(notification.metadata.userQuestion, 200)}`;
                 messageText += '\n\n';
             }
-            
+
             if (notification.metadata.claudeResponse) {
-                messageText += `🤖 *Claude Response:*\n${notification.metadata.claudeResponse.substring(0, 300)}`;
-                if (notification.metadata.claudeResponse.length > 300) {
-                    messageText += '...';
-                }
+                messageText += `🤖 *Claude Response:*\n${this._clip(notification.metadata.claudeResponse, 300)}`;
                 messageText += '\n\n';
             }
         }

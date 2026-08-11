@@ -431,21 +431,26 @@ class TelegramWebhookHandler {
         }
     }
 
+    /**
+     * These four replies quote things nobody wrote for Markdown -- a command
+     * typed on a phone, a tmux session name, an error string -- so they are sent
+     * as plain text. Telegram rejects the whole message over one unpaired `_`,
+     * and the reject is a log line: the command still ran and the operator saw
+     * no confirmation at all. Emoji carry the structure fine without markup.
+     */
     async _processCommand(chatId, token, command) {
         // Find session by token
         const session = await this._findSessionByToken(token);
         if (!session) {
-            await this._sendMessage(chatId, 
-                '❌ Invalid or expired token. Please wait for a new task notification.',
-                { parse_mode: 'Markdown' });
+            await this._sendMessage(chatId,
+                '❌ Invalid or expired token. Please wait for a new task notification.');
             return;
         }
 
         // Check if session is expired
         if (session.expiresAt < Math.floor(Date.now() / 1000)) {
-            await this._sendMessage(chatId, 
-                '❌ Token has expired. Please wait for a new task notification.',
-                { parse_mode: 'Markdown' });
+            await this._sendMessage(chatId,
+                '❌ Token has expired. Please wait for a new task notification.');
             await this._removeSession(session.id);
             return;
         }
@@ -455,20 +460,16 @@ class TelegramWebhookHandler {
             const tmuxSession = session.tmuxSession || 'default';
             await this.injector.injectCommand(command, tmuxSession);
             await this._markTelegramTaskActive(chatId, tmuxSession);
-            
-            // Send confirmation
-            await this._sendMessage(chatId, 
-                `✅ *Command sent successfully*\n\n📝 *Command:* ${command}\n🖥️ *Session:* ${tmuxSession}\n\nClaude is now processing your request...`,
-                { parse_mode: 'Markdown' });
-            
+
+            await this._sendMessage(chatId,
+                `✅ Command sent\n\n📝 ${command}\n🖥️ ${tmuxSession}`);
+
             // Log command execution
             this.logger.info(`Command injected - User: ${chatId}, Token: ${token}, Command: ${command}`);
-            
+
         } catch (error) {
             this.logger.error('Command injection failed:', error.message);
-            await this._sendMessage(chatId, 
-                `❌ *Command execution failed:* ${error.message}`,
-                { parse_mode: 'Markdown' });
+            await this._sendMessage(chatId, `❌ Command execution failed: ${error.message}`);
         }
     }
 
@@ -1169,9 +1170,19 @@ class TelegramWebhookHandler {
         await this._sendMessage(chatId, message, { parse_mode: 'Markdown' });
     }
 
+    /**
+     * Session names reach Markdown from tmux and the environment, so they are
+     * escaped rather than trusted: one `_` in a session name would cost the
+     * whole help message.
+     */
+    _escapeMarkdown(text) {
+        return String(text).replace(/([_*`\[])/g, '\\$1');
+    }
+
     async _sendHelpMessage(chatId) {
+        const selected = this._escapeMarkdown(this._getPanelSession(chatId));
         const aliasLines = Object.entries(this.config.sessionAliases || {})
-            .map(([alias, session]) => `• \`${alias} <command>\` → ${session}`)
+            .map(([alias, session]) => `• \`${alias} <command>\` → ${this._escapeMarkdown(session)}`)
             .join('\n');
         const message = `📚 *Claude Code Remote Bot Help*\n\n` +
             `*Commands:*\n` +
@@ -1183,8 +1194,8 @@ class TelegramWebhookHandler {
             `• \`/mode <ask|edits|plan|auto>\` - Set permission mode\n` +
             `• \`/session <alias>\` - Select the panel session\n` +
             `• \`/new <alias> <project>\` - Open an existing project in a new session\n` +
-            `• \`<command>\` - Send to ${this._getPanelSession(chatId)}\n` +
-            `• \`/cmd <command>\` - Send to ${this._getPanelSession(chatId)}\n` +
+            `• \`<command>\` - Send to ${selected}\n` +
+            `• \`/cmd <command>\` - Send to ${selected}\n` +
             `${aliasLines ? `${aliasLines}\n` : ''}` +
             `• \`/cmd <TOKEN> <command>\` - Explicit notification session\n\n` +
             `*Examples:*\n` +
