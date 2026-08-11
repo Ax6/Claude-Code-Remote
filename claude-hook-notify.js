@@ -55,10 +55,26 @@ async function sendHookNotification() {
     try {
         console.log('🔔 Claude Hook: Sending notifications...');
         const hookInput = await readHookInput();
-        
+
         // Get notification type from command line argument
         const notificationType = process.argv[2] || 'completed';
-        
+
+        // Which hook fired, on the record. Without this line a message that
+        // arrived on the phone and belonged to no conversation could only be
+        // traced by cross-referencing session files against transcripts.
+        const hookEvent = hookInput.hook_event_name || 'unknown';
+        console.log(`🪝 Hook: ${hookEvent} (argv "${notificationType}") · session ${hookInput.session_id || 'unknown'}`);
+
+        // `last_assistant_message` is only an answer to the operator when the
+        // turn itself ended. On SubagentStop it is whatever the last nested call
+        // produced -- including a suggested quick reply the harness generated for
+        // the CLI, which once reached Telegram as a bare "pusha tutto" looking
+        // exactly like a reply nobody wrote.
+        if (hookEvent === 'SubagentStop') {
+            console.log('⏭️ SubagentStop is not an answer to the operator; nothing sent.');
+            return;
+        }
+
         const channels = [];
         const results = [];
         
