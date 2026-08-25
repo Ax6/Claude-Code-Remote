@@ -51,6 +51,39 @@ async function readHookInput() {
     }
 }
 
+/**
+ * Which tmux session this run belongs to, or null for none.
+ *
+ * `tmux display-message -p "#S"` was the wrong question. Outside tmux it does
+ * not fail -- it reports the server's most recently active session. So a run
+ * with no tmux session at all, which is every desktop-app conversation, was
+ * attributed to whichever session had been touched last, and its notification
+ * arrived in the chat wearing that session's name.
+ *
+ * tmux sets TMUX in every pane process and a hook inherits it, so its absence
+ * is the authoritative answer: not in tmux, no session. When it is present,
+ * TMUX_PANE names our own pane, which resolves the session with no guessing.
+ */
+function resolveTmuxSession() {
+    // Set by the PTY relay, which knows the session it opened.
+    if (process.env.TMUX_SESSION) return process.env.TMUX_SESSION;
+    if (!process.env.TMUX) return null;
+
+    try {
+        const { execFileSync } = require('child_process');
+        const args = ['display-message', '-p'];
+        if (process.env.TMUX_PANE) args.push('-t', process.env.TMUX_PANE);
+        args.push('#S');
+        const name = execFileSync('tmux', args, {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore']
+        }).trim();
+        return name || null;
+    } catch (error) {
+        return null;
+    }
+}
+
 async function sendHookNotification() {
     try {
         console.log('🔔 Claude Hook: Sending notifications...');
@@ -82,7 +115,7 @@ async function sendHookNotification() {
                 });
                 const attached = await channel.offerSuggestion({
                     text: answer,
-                    session: process.env.TMUX_SESSION || null
+                    session: resolveTmuxSession()
                 });
                 console.log(attached
                     ? `💡 Suggested reply attached as a button: "${answer}"`
@@ -156,20 +189,7 @@ async function sendHookNotification() {
         const currentDir = hookInput.cwd || process.cwd();
         const projectName = path.basename(currentDir);
         
-        // Try to get current tmux session
-        let tmuxSession = process.env.TMUX_SESSION || 'claude-real';
-        try {
-            const { execSync } = require('child_process');
-            const sessionOutput = execSync('tmux display-message -p "#S"', { 
-                encoding: 'utf8',
-                stdio: ['ignore', 'pipe', 'ignore']
-            }).trim();
-            if (sessionOutput) {
-                tmuxSession = sessionOutput;
-            }
-        } catch (error) {
-            // Not in tmux or tmux not available, use default
-        }
+        const tmuxSession = resolveTmuxSession();
         
         // Create notification
         const notification = {
@@ -185,8 +205,23 @@ async function sendHookNotification() {
             }
         };
         
+        // Decided here as well as in the channel, so the per-channel result
+        // lines below say what actually happened. A skipped notification that
+        // reported "sent successfully" was the reason a message on the phone
+        // could not be traced back to a session.
+        const telegramEntry = channels.find(entry => entry.name === 'Telegram');
+        if (telegramEntry) {
+            const delivery = telegramEntry.channel.deliveryFor(notification);
+            if (delivery.mode === 'skip') {
+                console.log(`⏭️ Telegram skipped: ${delivery.reason}`);
+                channels.splice(channels.indexOf(telegramEntry), 1);
+            } else if (delivery.mode === 'brief') {
+                console.log(`📎 Telegram gets a one-line notice: ${delivery.reason}`);
+            }
+        }
+
         console.log(`📱 Sending ${notificationType} notification for project: ${projectName}`);
-        console.log(`🖥️ Tmux session: ${tmuxSession}`);
+        console.log(`🖥️ Tmux session: ${tmuxSession || 'none (not inside tmux)'}`);
         
         // Send notifications to all configured channels
         for (const { name, channel } of channels) {

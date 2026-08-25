@@ -9,7 +9,7 @@ const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
 const TmuxMonitor = require('../../utils/tmux-monitor');
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 const { toRichMarkdown, splitRichMarkdown } = require('./rich-markdown');
 const { SuggestionStore, looksLikeSuggestion, suggestionKeyboard } = require('./suggestion-store');
 
@@ -25,6 +25,12 @@ class TelegramChannel extends NotificationChannel {
                 path.join(path.dirname(this.sessionsDir), 'reply-suggestions.json'),
             logger: this.logger
         });
+
+        // The session the panel is pointed at, written by the webhook. Same
+        // derivation as start-telegram-webhook.js, so both processes agree on
+        // the file without it having to be threaded through every caller.
+        this.selectedSessionsFile = process.env.TELEGRAM_SELECTED_SESSIONS_FILE ||
+            path.join(path.dirname(this.sessionsDir), 'selected-sessions.json');
 
         this._ensureDirectories();
         this._validateConfig();
@@ -70,19 +76,116 @@ class TelegramChannel extends NotificationChannel {
         return token;
     }
 
+    /**
+     * The session this process is in, or null.
+     *
+     * Not `display-message` unscoped: outside tmux that reports the server's
+     * most recently active session instead of failing, which attributes a
+     * notification to a session that had nothing to do with it. TMUX is set in
+     * every pane process, so its absence settles the question.
+     */
     _getCurrentTmuxSession() {
+        if (process.env.TMUX_SESSION) return process.env.TMUX_SESSION;
+        if (!process.env.TMUX) return null;
+
         try {
-            // Try to get current tmux session
-            const tmuxSession = execSync('tmux display-message -p "#S"', { 
+            const args = ['display-message', '-p'];
+            if (process.env.TMUX_PANE) args.push('-t', process.env.TMUX_PANE);
+            args.push('#S');
+            const name = execFileSync('tmux', args, {
                 encoding: 'utf8',
                 stdio: ['ignore', 'pipe', 'ignore']
             }).trim();
-            
-            return tmuxSession || null;
+            return name || null;
         } catch (error) {
-            // Not in a tmux session or tmux not available
             return null;
         }
+    }
+
+    /**
+     * The session this chat is pointed at, or null when that cannot be known.
+     *
+     * Null means notify: a selection that cannot be read must not silence the
+     * machine, because the failure would look exactly like Claude going quiet.
+     */
+    _selectedSession() {
+        const chatId = String(this.config.groupId || this.config.chatId || '');
+        try {
+            if (!this.selectedSessionsFile || !fs.existsSync(this.selectedSessionsFile)) {
+                return this.config.defaultSession || null;
+            }
+            const parsed = JSON.parse(fs.readFileSync(this.selectedSessionsFile, 'utf8'));
+            return parsed[chatId] || this.config.defaultSession || null;
+        } catch (error) {
+            this.logger.warn(`Could not read the selected session: ${error.message}`);
+            return null;
+        }
+    }
+
+    /**
+     * Whether a session name is a session the tmux server actually has.
+     *
+     * `=` makes the match exact: without it `-t` accepts a prefix, so a stale
+     * name would resolve to whichever live session happens to start with it.
+     */
+    _isLiveTmuxSession(name) {
+        if (!name) return false;
+        try {
+            // execFileSync rather than a shell: a session name is data, and a
+            // command built by string interpolation would have to be quoted
+            // correctly forever.
+            execFileSync('tmux', ['has-session', '-t', `=${name}`], { stdio: 'ignore' });
+            return true;
+        } catch (error) {
+            return false;
+        }
+    }
+
+    /**
+     * Which of three deliveries a notification gets, and why.
+     *
+     * The panel talks to one session and `/cmd` reaches that one. The hook,
+     * though, is registered globally: every Claude Code on the machine fires it,
+     * the desktop app included. Those runs are in no tmux session at all, so
+     * nothing sent from this chat could ever reach them -- a notification for
+     * one is unactionable by construction, and that is the flood. A different
+     * tmux session is actionable, just not from here until it is selected, so it
+     * is worth a line rather than silence.
+     */
+    deliveryFor(notification) {
+        const session = notification.metadata?.tmuxSession || null;
+        const selected = this._selectedSession();
+
+        if (!this._isLiveTmuxSession(session)) {
+            return {
+                mode: 'skip',
+                session,
+                selected,
+                reason: session
+                    ? `${session} is not a live tmux session`
+                    : 'this run is in no tmux session (the desktop app, or a bare terminal)'
+            };
+        }
+        if (!selected) {
+            return { mode: 'full', session, selected, reason: 'no session is selected, so nothing to filter against' };
+        }
+        if (session === selected) {
+            return { mode: 'full', session, selected, reason: `${session} is the selected session` };
+        }
+        return { mode: 'brief', session, selected, reason: `${session} is not the selected session (${selected})` };
+    }
+
+    /**
+     * What a non-selected session gets: that it finished, and where.
+     *
+     * No transcript and no buttons, because the token under a full notification
+     * would relay into the selected session instead -- the wrong one.
+     */
+    _generateBriefNotice(notification, delivery) {
+        const project = notification.project || 'unknown project';
+        const what = notification.type === 'completed' ? 'finished' : 'needs input';
+        return `⚙️ *${project}* ${what} · \`${delivery.session}\`\n`
+            + `_Not selected — pick it under Controls to reply._`;
     }
 
     async _getBotUsername() {
@@ -128,6 +231,19 @@ class TelegramChannel extends NotificationChannel {
             };
         }
         
+        // Decided before the session record is written, so a notification that
+        // is never sent leaves no token, no session file and no anchor behind.
+        const target = this.config.groupId || this.config.chatId;
+        const delivery = this.deliveryFor(notification);
+        if (delivery.mode === 'skip') {
+            this.logger.info(`Not notifying: ${delivery.reason}`);
+            return true;
+        }
+        if (delivery.mode === 'brief') {
+            this.logger.info(`Brief notice only: ${delivery.reason}`);
+            return Boolean(await this._sendRich(target, this._generateBriefNotice(notification, delivery), null));
+        }
+
         // Create session record
         await this._createSession(sessionId, notification, token);
 
@@ -212,7 +328,7 @@ class TelegramChannel extends NotificationChannel {
                 rich_message: { markdown: chunk }
             };
             // Buttons belong on the last piece, where the reply ends.
-            if (isLast) payload.reply_markup = { inline_keyboard: buttons };
+            if (isLast && buttons?.length) payload.reply_markup = { inline_keyboard: buttons };
 
             try {
                 const response = await axios.post(
@@ -270,7 +386,10 @@ class TelegramChannel extends NotificationChannel {
 
         const chatId = this.config.groupId || this.config.chatId;
         const entry = this.suggestions.read(chatId);
-        if (!entry || (session && entry.session && entry.session !== session)) return false;
+        // The anchor belongs to whichever session last answered here, so a
+        // suggestion that names no session -- a desktop run, which is in no tmux
+        // session -- would attach as a button under a different session's answer.
+        if (!entry || !session || entry.session !== session) return false;
 
         const added = this.suggestions.addSuggestion(chatId, String(text).trim());
         if (!added) return false;
